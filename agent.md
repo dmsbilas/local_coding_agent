@@ -1,545 +1,411 @@
 # Understanding `agent.py`
 
-A thorough guide to the LangGraph coding agent — written so you can learn *why* each piece exists, not only *what* it does.
+A thorough guide to the **autonomous** LangGraph coding agent — written so you can learn *why* each piece exists, not only *what* it does.
 
 ---
 
 ## 1. Big picture
 
-`agent.py` is the **brain** of this project. `main.py` is only the CLI (read input, print output, call `app.invoke()`). All AI logic lives here.
+`agent.py` is the **brain** of this project. `main.py` is only the CLI (read one task description, stream progress, print results). All AI logic lives here.
 
 ### What problem does it solve?
 
-1. User describes code they want.
-2. A local LLM (Ollama + `qwen2.5-coder:7b`) **generates** code.
-3. The same LLM **reviews** that code.
-4. The CLI asks for feedback; user can refine or **accept**.
-5. On accept, code is saved as a **real source file** (not JSON), with an **intuitive filename**.
+1. User describes code they want **once**.
+2. The LLM **generates** code (does not write to disk yet).
+3. The same LLM **validates** that code against the original request.
+4. If not approved → validator feedback is fed back → generate again.
+5. Loop continues until the validator is happy **or** `MAX_REVISIONS` is hit.
+6. Only when approved → **write files** to the project folder → finish.
+
+There is **no** user `accept` step. Approval is entirely LLM-driven.
 
 ### Mental model
 
-Think of the agent as a **state machine** (a graph):
-
 ```
-                    ┌─────────────┐
-                    │  tools      │  (runs write_file)
-                    └──────┬──────┘
-           tool_calls ▲    │
-                      │    │ after_tools
-           ┌──────────┴────▼──────────┐
-user ───►  │     generate_code        │
-           └──────────┬───────────────┘
-                      │ no tool_calls
-                      ▼
-           ┌──────────────────────────┐
-           │      review_code         │──tool_calls──► tools ──► ask_user
-           └──────────┬───────────────┘
-                      │ no tool_calls
-                      ▼
-           ┌──────────────────────────┐
-           │       ask_user           │  (pause; main.py takes over)
-           └──────────────────────────┘
+                         ┌──────────────────────────────────────┐
+                         │                                      │
+                         ▼                                      │
+user request ──► generate_code ──► validate_code                │
+                                      │                         │
+                     ┌────────────────┼────────────────┐        │
+                     │                │                │        │
+                     ▼                ▼                ▼        │
+              write_files    generate_code again   fail_max_    │
+                     │       (with [VALIDATOR]      revisions   │
+                     │        feedback)                 │       │
+                     │                │                 │       │
+                     └───────┬────────┴────────┬────────┘       │
+                             │                 │                │
+                             ▼                 ▼                │
+                            END               END               │
+                                                                │
+                     (not approved & iteration < MAX) ──────────┘
 ```
-
-On **accept** (outside the graph), `main.py` calls `save_accepted_code()`, which may call the LLM **again** to clean the code and pick a filename, then writes the file.
 
 ---
 
-## 2. Key concepts (learn these first)
+## 2. Key concepts
 
 ### LangGraph
 
-LangGraph lets you build agents as graphs:
-
 | Concept | Meaning |
 |---------|---------|
-| **State** | Shared data that flows through the graph (`messages`, `status`) |
+| **State** | Shared data flowing through the graph (`messages`, `approved`, `files`, …) |
 | **Node** | A function that reads state and returns updates |
-| **Edge** | Connection from one node to the next |
-| **Conditional edge** | A router function that *chooses* the next node |
-| **Checkpointer** | Saves state per `thread_id` so follow-up `invoke()` calls remember history |
+| **Edge** | Always go to a fixed next node |
+| **Conditional edge** | A router chooses the next node from state |
+| **Checkpointer** | Saves state per `thread_id` |
+| **END** | Terminal node — the run finishes |
 
 ### Messages
 
-Conversation is a list of messages (`HumanMessage`, `AIMessage`, `ToolMessage`).  
-`MessagesState` automatically **appends** new messages when a node returns `{"messages": [...]}`.
+Conversation is a list of messages (`HumanMessage`, `AIMessage`).  
+`MessagesState` **appends** when a node returns `{"messages": [...]}`.
+
+Validator feedback is injected as a `HumanMessage` starting with `[VALIDATOR]` so the next generate pass must address it.
 
 ### Tools
 
-A **tool** is a Python function the LLM can request.  
-`llm.bind_tools([write_file])` teaches the model the tool schema.  
-If the model emits `tool_calls`, `ToolNode` runs the real Python function.
+`write_file` is a LangChain `@tool`, but in this design it is **called by the `write_files` node** after approval — not by the model inventing tool-call JSON during generation. That avoids the old bug where JSON tool text was saved as “source code.”
 
-### Why so much JSON / fence parsing?
+### Why JSON parsing helpers?
 
-Local models often:
-
-- Paste a fake `write_file` JSON into chat instead of a real tool call
-- Wrap review output in JSON
-- Put code inside markdown \`\`\` fences
-
-The helper functions exist so **accept** still saves clean source code even when the model is messy.
+The **validator** must return structured JSON (`approved`, `feedback`, `files`). Local models sometimes wrap it in fences or add prose. Helpers extract a real `dict` reliably.
 
 ---
 
-## 3. File structure (map of sections)
+## 3. File map
 
-| Lines (approx.) | Section | Purpose |
-|-----------------|---------|---------|
-| 1–18 | Imports | Libraries |
-| 19–36 | Config | Project root + Ollama LLM |
-| 39–70 | `write_file` tool | Safe disk writes |
-| 72–170 | Extract helpers | Pull real code out of messy text |
-| 172–351 | Accept / finalize | Clean code + filename + save |
-| 353–365 | Code-gen prompt | Instructions for generation |
-| 368–374 | `AgentState` | Graph state schema |
-| 377–424 | Nodes | generate / review / ask_user |
-| 427–450 | Routers | Decide next node |
-| 453–486 | Graph build | Wire everything into `app` |
-
----
-
-## 4. Imports and startup
-
-```python
-import json, os, re
-from pathlib import Path
-from typing import Literal
-```
-
-- `json` — parse tool/review/finalize JSON  
-- `os` — read `OLLAMA_BASE_URL`, `MODEL_NAME`  
-- `re` — extract markdown code fences  
-- `Path` — safe paths, project-root checks  
-- `Literal` — type-safe router return values  
-
-```python
-from dotenv import load_dotenv
-from langchain_core.tools import tool
-from langchain_ollama import ChatOllama
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode
-
-load_dotenv()
-```
-
-- `load_dotenv()` loads a `.env` file into environment variables (optional overrides).
-- `ChatOllama` talks to your local Ollama server.
-- `StateGraph` + `MessagesState` are the graph foundation.
-- `ToolNode` executes tool calls.
-- `MemorySaver` keeps conversation memory in RAM keyed by `thread_id`.
+| Section | Purpose |
+|---------|---------|
+| Config | Project root, Ollama, `MAX_REVISIONS` |
+| `write_file` | Safe disk writes |
+| Parsing helpers | JSON / fences / path / file-list cleanup |
+| Prompts | Generate + validate system prompts |
+| `AgentState` | Graph state schema |
+| Nodes | `generate_code`, `validate_code`, `write_files`, `fail_max_revisions` |
+| Router | `after_validate` |
+| Graph compile | Wire nodes → `app` |
+| `new_thread_id` | Fresh run id for each user task |
 
 ---
 
-## 5. Project root and LLM setup
+## 4. Config
 
 ```python
 PROJECT_ROOT = Path(__file__).resolve().parent
-```
-
-`__file__` is `agent.py`’s path. `.resolve().parent` is the project folder.  
-**Every write must stay under this directory** (security sandbox).
-
-```python
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:7b")
-
-llm = ChatOllama(
-    model=MODEL_NAME,
-    base_url=OLLAMA_BASE_URL,
-    temperature=0.2,
-)
+MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "6"))
 ```
 
-- Defaults assume Ollama is running locally with `qwen2.5-coder:7b` pulled.
-- `temperature=0.2` → more deterministic, less “creative” nonsense (good for code).
+| Variable | Role |
+|----------|------|
+| `PROJECT_ROOT` | Sandbox root — all writes must stay under here |
+| `OLLAMA_BASE_URL` | Local Ollama HTTP API |
+| `MODEL_NAME` | Coding model (same model generates *and* validates) |
+| `MAX_REVISIONS` | Cap on validate→revise loops (default 6) |
 
-There are effectively **two** LLM handles later:
+```python
+llm = ChatOllama(..., temperature=0.2)
+```
 
-| Handle | Used for |
-|--------|----------|
-| `llm` | Finalize-on-accept (no tools) |
-| `llm_with_tools` | Generate + review (can call `write_file`) |
+Low temperature → more deterministic code and validation JSON.
+
+### Protected names
+
+```python
+_PROTECTED_NAMES = {"agent.py", "main.py", "architecture.md", "agent.md", ".gitignore"}
+```
+
+The agent must not overwrite its own infrastructure files.
 
 ---
 
-## 6. The `write_file` tool
+## 5. `write_file` tool
 
 ```python
 @tool
 def write_file(relative_path: str, content: str) -> str:
 ```
 
-`@tool` turns this into a LangChain tool. The **docstring matters** — the model reads it to know when/how to call the tool.
+### Safety checks
 
-### Path safety (critical)
+1. Resolve `PROJECT_ROOT / relative_path`.
+2. `relative_to(PROJECT_ROOT)` — reject `../` escapes.
+3. Refuse protected basenames.
+4. `mkdir` parents, write UTF-8, return a success/error string.
 
-```python
-target = (PROJECT_ROOT / relative_path).resolve()
-try:
-    target.relative_to(PROJECT_ROOT)
-except ValueError:
-    return "Error: path escapes..."
-```
-
-Example attack blocked: `relative_path="../secret.txt"`  
-After resolve, that would be *outside* `PROJECT_ROOT`, so `relative_to` raises and we refuse to write.
-
-### Write
-
-```python
-target.parent.mkdir(parents=True, exist_ok=True)
-target.write_text(content, encoding="utf-8")
-```
-
-Creates folders like `new/` if needed, then writes UTF-8 text.
-
-```python
-TOOLS = [write_file]
-llm_with_tools = llm.bind_tools(TOOLS)
-```
-
-`bind_tools` attaches the tool schema to the model so it can emit structured `tool_calls`.
+Used only from `write_files` after the validator approves.
 
 ---
 
-## 7. Protected filenames
-
-```python
-_PROTECTED_NAMES = {"agent.py", "main.py", "architecture.md", ".gitignore"}
-```
-
-If the model tries to save as `agent.py`, we rewrite to something like `agent_app.py` so the agent cannot destroy itself.
-
----
-
-## 8. Helper functions — cleaning messy model output
-
-These exist because **local models are unreliable about formats**.
+## 6. Parsing helpers
 
 ### `_looks_like_json_blob(text)`
 
-Returns `True` if text looks like JSON (or JSON-ish with keys like `"fixed_code"`).  
-Used to **refuse** saving JSON as if it were Python/JS source.
-
-### `_code_from_fences(text)`
-
-Finds markdown fences:
-
-````markdown
-```python
-print("hi")
-```
-````
-
-Prefers non-`json` fences, picks the **largest** block, rejects JSON bodies.
+Detects JSON (or JSON-ish text with keys like `"approved"`). Used so we never treat a JSON blob as runnable source.
 
 ### `_parse_json_object(text)`
 
 Best-effort parse:
 
-1. Strip whitespace  
-2. Unwrap \`\`\`json fences if present  
-3. `json.loads` whole string  
-4. Else find `{...}` substring and parse that  
+1. Unwrap \`\`\`json fences if present  
+2. `json.loads` whole string  
+3. Else find `{...}` and parse that  
 
 Returns a `dict` or `None`.
 
-### `_code_from_tool_json(text)`
+### `_code_from_fences(text)`
 
-Handles the common failure mode where the model **prints** this instead of calling the tool:
+Pulls the largest non-`json` markdown code fence. Rejects if the body looks like JSON.
 
-```json
-{"name": "write_file", "arguments": {"relative_path": "hello.py", "content": "print(1)"}}
-```
+### `_sanitize_path(path)`
 
-We unwrap and return `("print(1)", "hello.py")` — real source + path.
+Strips `./`, renames protected names to `stem_app.ext`.
 
-Also supports flat form: `{"relative_path": "...", "content": "..."}`.
+### `_normalize_files(raw_files)`
 
-### `_code_from_review_json(text)`
+Turns validator `files` into a clean list of `{relative_path, content}`:
 
-Older review format had `{"issues": [...], "fixed_code": "..."}`.  
-Pulls `fixed_code` if it is real source, not nested JSON.
-
-### `extract_accepted_code(messages)`
-
-Walks the conversation (newest first) and returns `(code, path)` using this priority:
-
-1. Real structured `tool_calls` for `write_file`
-2. Tool JSON pasted as AI text
-3. Reviewer `fixed_code`
-4. Largest markdown code fence
-
-**Never** returns a raw JSON/tool-call blob as “code”.
+- Accepts keys `relative_path` / `path` / `filename` and `content` / `code`
+- Sanitizes paths
+- Unwraps accidental fences
+- Drops empty or JSON-looking content
 
 ---
 
-## 9. Accept path — finalize with the LLM
+## 7. Prompts
 
-When the user types `accept` in `main.py`, it calls `save_accepted_code(messages)`.
+### `CODE_GEN_SYSTEM_PROMPT`
 
-### Why call the LLM again?
+Tells the generator:
 
-Because chat history may still contain:
+1. Implement the user request fully  
+2. Treat `[VALIDATOR]` messages as mandatory feedback  
+3. **Do not** write to disk — validation/write steps handle that  
+4. Use markdown fences; name files intuitively  
+5. No fake tool-call JSON  
 
-- Explanations mixed with code  
-- Wrong formats  
-- Unclear filenames  
+### `VALIDATE_SYSTEM_PROMPT`
 
-A dedicated **finalize** pass asks the model for one clean payload:
+Tells the validator to return **only** JSON:
 
+**Not approved:**
 ```json
 {
-  "relative_path": "hello_world.py",
-  "content": "def main():\n    print(\"Hello\")\n..."
+  "approved": false,
+  "feedback": "Actionable list of fixes",
+  "files": []
 }
 ```
 
-### `_conversation_digest(messages)`
-
-Builds a short `USER:` / `ASSISTANT:` transcript (last ~12 messages, AI text capped at 4000 chars) so the finalize prompt stays small.
-
-### `_FINALIZE_SYSTEM`
-
-System instructions for that finalize call:
-
-- Return **only** JSON with `relative_path` + `content`  
-- Meaningful filename (`hello_world.py`, not `generated.py`)  
-- `content` must be **pure source code**  
-- Do not overwrite `agent.py` / `main.py`
-
-### `_finalize_with_llm(messages)`
-
-1. Build digest + optional locally extracted hint  
-2. Call `llm.invoke` (no tools) up to **2** times  
-3. Parse JSON; if invalid or content looks like JSON → retry with correction message  
-4. Strip accidental fences from `content`  
-5. Rename if path hits `_PROTECTED_NAMES`  
-6. Return `(content, path)` or `(None, None)`
-
-### `save_accepted_code(messages, relative_path=None)`
-
-```text
-finalize with LLM
-    ↓ fail?
-local extract_accepted_code
-    ↓ fail?
-return Error
-    ↓
-guard protected names + refuse JSON blobs
-    ↓
-write_file.invoke(...)
+**Approved (ready to write):**
+```json
+{
+  "approved": true,
+  "feedback": "",
+  "files": [
+    {
+      "relative_path": "hello_world.py",
+      "content": "<pure source code>"
+    }
+  ]
+}
 ```
 
-This is the **reliable save path**. Generation-time tool calls are optional; accept always tries to persist clean code.
+`approved=true` is allowed only when code is correct **and** `files` contains real source.
 
 ---
 
-## 10. Generation system prompt
-
-`CODE_GEN_SYSTEM_PROMPT` tells the coding model:
-
-1. Ask if the request is ambiguous  
-2. Write complete, runnable code  
-3. Comment non-obvious logic  
-4. Follow language best practices  
-5. Prefer markdown fences for readability  
-6. Suggest intuitive filenames; don’t overwrite agent files  
-7. If using `write_file`, put **only source** in `content`
-
-This prompt is prepended as a `system` message inside `generate_code`.
-
----
-
-## 11. State: `AgentState`
+## 8. State: `AgentState`
 
 ```python
 class AgentState(MessagesState, total=False):
-    status: str  # "generating" | "reviewing" | "fixed" | "done"
+    status: str       # generating | validating | revising | writing | done | failed
+    approved: bool
+    feedback: str
+    files: list       # [{relative_path, content}, ...]
+    iteration: int    # how many validate rounds so far
+    write_results: list
 ```
 
-- Inherits `messages` from `MessagesState` (append-only list).  
-- Adds `status` so routers know whether tools were requested during **generate** or **review**.
-
-`total=False` means extra keys are optional TypedDict-style fields.
+| Field | Meaning |
+|-------|---------|
+| `messages` | Full conversation (from `MessagesState`) |
+| `status` | Human-readable stage for the CLI |
+| `approved` | Validator decision |
+| `feedback` | Last rejection reasons |
+| `files` | Approved payloads ready to write |
+| `iteration` | Validate counter (compared to `MAX_REVISIONS`) |
+| `write_results` | Strings returned by `write_file` |
 
 ---
 
-## 12. Nodes (the work units)
+## 9. Nodes
 
-### `generate_code(state)`
+### `generate_code`
+
+1. Prepend `CODE_GEN_SYSTEM_PROMPT`  
+2. `llm.invoke(messages)`  
+3. Append AI reply  
+4. Set `status` to `"generating"` (first pass) or `"revising"`  
+5. Set `approved=False`  
+
+Does **not** touch the filesystem.
+
+### `validate_code`
+
+1. Increment `iteration`  
+2. Call LLM with `VALIDATE_SYSTEM_PROMPT` + history  
+3. Parse JSON (retry once if unparseable)  
+4. Normalize `files`  
+5. If `approved` but files empty/invalid → force `approved=False` with feedback  
+
+**If approved:**  
+- Store cleaned `files`  
+- Append summary `AIMessage`  
+- `status="writing"`  
+
+**If not approved:**  
+- Append raw validator text + `[VALIDATOR] …` `HumanMessage` with feedback  
+- Clear `files`  
+- Next hop will be `generate_code` again  
+
+### `write_files`
+
+For each approved `{relative_path, content}`:
 
 ```python
-messages = [
-    {"role": "system", "content": CODE_GEN_SYSTEM_PROMPT},
-    *state["messages"],
-]
-response = llm_with_tools.invoke(messages)
-return {"messages": [response], "status": "generating"}
+write_file.invoke({"relative_path": path, "content": content})
 ```
 
-- Prepends the coding system prompt  
-- Calls the tool-enabled LLM  
-- Appends the AI reply to state  
-- Marks status as `"generating"`
+Sets `status` to `"done"` if every write succeeded, else `"failed"`.  
+Stores `write_results` for the CLI summary.
 
-The reply might be plain text **or** include `tool_calls`.
+### `fail_max_revisions`
 
-### `review_code(state)`
-
-Same pattern with a **reviewer** system prompt:
-
-- Look for bugs, missing error handling, style issues  
-- Reply with a short review + corrected code in a markdown fence  
-- Fence must contain **only** source code  
-
-Sets `status="reviewing"`.
-
-### `ask_user(state)`
-
-```python
-return {"messages": [], "status": "pending_feedback"}
-```
-
-Does **not** add messages. It only marks that the graph is waiting.  
-`main.py` prints output and prompts for feedback / accept.
+Reached when still not approved after `MAX_REVISIONS` rounds.  
+Emits a failure message with the last feedback; `status="failed"`. No files written.
 
 ---
 
-## 13. Routers (traffic cops)
+## 10. Router: `after_validate`
 
-### `after_generate`
+```python
+def after_validate(state):
+    if state.get("approved") and state.get("files"):
+        return "write_files"
+    if int(state.get("iteration") or 0) >= MAX_REVISIONS:
+        return "fail_max_revisions"
+    return "generate_code"
+```
 
-| Condition | Next node |
-|-----------|-----------|
-| Last AI message has `tool_calls` | `tools` |
-| Otherwise | `review_code` |
-
-### `after_review`
-
-| Condition | Next node |
-|-----------|-----------|
-| Has `tool_calls` | `tools` |
-| Otherwise | `ask_user` |
-
-### `after_tools`
-
-| `status` | Next node | Why |
-|----------|-----------|-----|
-| `"reviewing"` | `ask_user` | Don’t loop forever after a review write |
-| else (`"generating"`) | `generate_code` | Classic ReAct: observe tool result, think again |
+| Condition | Next |
+|-----------|------|
+| Approved + valid files | `write_files` |
+| Hit revision limit | `fail_max_revisions` |
+| Otherwise | `generate_code` (revise) |
 
 ---
 
-## 14. Building and compiling the graph
+## 11. Graph wiring
 
 ```python
-workflow = StateGraph(AgentState)
-
-workflow.add_node("generate_code", generate_code)
-workflow.add_node("review_code", review_code)
-workflow.add_node("ask_user", ask_user)
-workflow.add_node("tools", ToolNode(TOOLS))
-
 workflow.set_entry_point("generate_code")
-```
+workflow.add_edge("generate_code", "validate_code")
+workflow.add_conditional_edges("validate_code", after_validate, {...})
+workflow.add_edge("write_files", END)
+workflow.add_edge("fail_max_revisions", END)
 
-Every run starts at `generate_code`.
-
-```python
-workflow.add_conditional_edges("generate_code", after_generate, {...})
-workflow.add_conditional_edges("review_code", after_review, {...})
-workflow.add_conditional_edges("tools", after_tools, {...})
-```
-
-The third argument maps **router return strings** → **node names**.
-
-```python
-memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 ```
 
-- `app` is what `main.py` imports.  
-- `checkpointer=memory` means each `thread_id` keeps message history across `invoke()` calls (feedback loops remember prior turns).
+| From | To |
+|------|----|
+| start | `generate_code` |
+| `generate_code` | `validate_code` (always) |
+| `validate_code` | `write_files` / `generate_code` / `fail_max_revisions` |
+| `write_files` | `END` |
+| `fail_max_revisions` | `END` |
+
+```python
+def new_thread_id() -> str:
+    return f"run-{uuid.uuid4().hex[:12]}"
+```
+
+Each user task gets a **fresh** thread so runs don’t share polluted history.
 
 ---
 
-## 15. End-to-end example
+## 12. How `main.py` drives the agent
 
-**User:** “Write a hello world in Python”
+1. Read one description (or `quit`).  
+2. `app.stream(...)` with `stream_mode="updates"` so each node prints live.  
+3. Show AI output and `[VALIDATOR]` feedback as they appear.  
+4. After the graph ends, read final state:
+   - `status == "done"` → print written file paths  
+   - `status == "failed"` → report stop without writes  
 
-1. `main.py` → `app.invoke({"messages": [("user", "...")]}, config)`  
-2. **generate_code** produces code (maybe with fences)  
-3. No tool calls → **review_code**  
-4. Review adds a fenced final version → **ask_user**  
-5. CLI shows messages; user types `accept`  
-6. `save_accepted_code`:  
-   - `_finalize_with_llm` → e.g. `hello_world.py` + clean `print("Hello...")`  
-   - `write_file` writes the file under `PROJECT_ROOT`  
-7. CLI prints success
+No accept/feedback prompts. The user only starts the job.
 
-**If user types feedback instead of accept:**  
-`main.py` invokes again with `[USER] ...`; same thread resumes; generate → review → ask_user again.
+`recursion_limit` is raised so generate↔validate loops don’t hit LangGraph’s default cap.
 
 ---
 
-## 16. How this file talks to `main.py`
+## 13. End-to-end example
 
-| Export | Used by CLI for |
-|--------|-----------------|
-| `app` | Run the generate/review graph |
-| `save_accepted_code` | Persist on accept |
-| `extract_accepted_code` | (available; save uses it as fallback) |
-| `write_file` / `PROJECT_ROOT` | Internals / tests |
+**User:** “Write a Python script that prints the current time”
 
-`main.py` responsibilities only:
+1. **generate_code** → proposes `show_time.py` with code in a fence  
+2. **validate_code** → maybe `approved=false`, feedback: “use timezone-aware datetime”  
+3. **generate_code** → revises using `[VALIDATOR]` note  
+4. **validate_code** → `approved=true` + `files: [{relative_path: "show_time.py", content: "..."}]`  
+5. **write_files** → creates `show_time.py` on disk  
+6. **END** → CLI prints success  
 
-- Read stdin  
-- Print new AI/tool messages  
-- On accept → `save_accepted_code`  
-- On feedback → another `app.invoke`
+If the validator never approves within 6 rounds → `fail_max_revisions` → END with error.
 
 ---
 
-## 17. Design decisions (why it looks this way)
+## 14. Design decisions
 
 | Decision | Reason |
 |----------|--------|
-| Local Ollama | Runs offline; no cloud API required |
-| Generate then review | Two-pass quality without a huge single prompt |
-| `write_file` tool | Model *can* save during generation |
-| Finalize on accept | Model often fails tool calling; accept must still save clean code |
-| Path sandbox | Prevent writing outside the project |
-| Protected names | Don’t let the agent overwrite its own source |
-| Reject JSON blobs | Earlier bug: `hello.py` contained tool-call JSON |
-| MemorySaver | Feedback iterations need full chat context |
+| Autonomous validate loop | No human accept; agent owns quality gate |
+| Same local model for gen + validate | Simple setup; works offline with Ollama |
+| Write only after approve | Avoids saving half-baked or JSON blobs |
+| Programmatic `write_file` in node | Reliable disk IO; model doesn’t need tool-calling for saves |
+| `[VALIDATOR]` human messages | Clear signal for the generator to revise |
+| `MAX_REVISIONS` | Prevents infinite loops |
+| Path sandbox + protected names | Safety |
+| Fresh `thread_id` per task | Clean slate each project |
 
 ---
 
-## 18. Glossary
+## 15. Glossary
 
 | Term | Meaning |
 |------|---------|
-| **Node** | One step function in the graph |
-| **Router** | Chooses the next node from state |
-| **Tool** | Python function the LLM can request |
-| **ToolNode** | Executes those requests |
-| **Checkpointer** | Persists state between invokes |
+| **Generate** | LLM writes/revises code in chat |
+| **Validate** | LLM judges code; returns approve or feedback JSON |
+| **Revision** | One generate←validate cycle after rejection |
+| **Approve** | Validator sets `approved=true` and supplies `files` |
+| **write_files** | Node that persists approved source to disk |
 | **Fence** | Markdown \`\`\`code\`\`\` block |
-| **Finalize** | Extra LLM call on accept to produce clean file + name |
-| **ReAct loop** | Reason → Act (tool) → Observe → Reason again |
+| **Checkpointer** | Persists graph state for a thread |
+| **END** | Graph finished |
 
 ---
 
-## 19. Suggested learning order
+## 16. Suggested learning order
 
-1. Read **Big picture** + diagram  
-2. Skim **Nodes** and **Routers**  
-3. Read **`write_file`** + path safety  
-4. Trace one run with a simple “hello world” request  
-5. Study **extract helpers** + **finalize** (the accept path)  
-6. Open `main.py` and match each CLI step to `app` / `save_accepted_code`
+1. Big picture + diagram  
+2. `AgentState` fields  
+3. `generate_code` → `validate_code` → `after_validate`  
+4. Validator JSON shape + `_normalize_files`  
+5. `write_files` + path safety  
+6. Skim `main.py` streaming loop  
+7. Trace one real run with `.env/bin/python main.py`
 
-Once those click, the whole file is just “graph + tools + careful save.”
+Once those click, the file is: **generate, judge, revise, then write.**

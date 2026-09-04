@@ -1,33 +1,38 @@
 """
-langgraph-based AI coding agent that uses a local Ollama instance
-with the qwen2.5-coder:7b model to generate, review, and fix code.
+Autonomous LangGraph coding agent.
+
+Flow:
+  generate_code → validate_code ⟲ (revise until approved) → write_files → END
+
+A local Ollama model (default qwen2.5-coder:7b) both writes and validates.
+Files are written only after the validator fully approves.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
+import uuid
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import MessagesState, StateGraph
-from langgraph.prebuilt import ToolNode
+from langgraph.graph import END, MessagesState, StateGraph
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Project root — all file writes are confined here
+# Config
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-# ---------------------------------------------------------------------------
-# Ollama configuration
-# ---------------------------------------------------------------------------
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5-coder:7b")
+MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "6"))
 
 llm = ChatOllama(
     model=MODEL_NAME,
@@ -35,23 +40,26 @@ llm = ChatOllama(
     temperature=0.2,
 )
 
+_PROTECTED_NAMES = {
+    "agent.py",
+    "main.py",
+    "architecture.md",
+    "agent.md",
+    ".gitignore",
+}
+
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools / file IO
 # ---------------------------------------------------------------------------
 @tool
 def write_file(relative_path: str, content: str) -> str:
     """Write content to a file inside the project folder.
 
-    Use this tool to create or overwrite source files so the generated
-    code lives on disk under the project root (not just in chat).
-
     Args:
-        relative_path: Path relative to the project root, e.g. "src/app.py"
-            or "hello.py". Do not use absolute paths.
-        content: Full file contents to write.
+        relative_path: Path relative to the project root, e.g. "hello_world.py".
+        content: Full source-file contents (never JSON / tool-call text).
     """
-    # Normalize and resolve; reject path traversal outside PROJECT_ROOT
     target = (PROJECT_ROOT / relative_path).resolve()
     try:
         target.relative_to(PROJECT_ROOT)
@@ -61,25 +69,19 @@ def write_file(relative_path: str, content: str) -> str:
             "Use a path relative to the project root."
         )
 
+    name = target.name.lower()
+    if name in _PROTECTED_NAMES:
+        return f"Error: refusing to overwrite protected file '{relative_path}'."
+
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return f"Successfully wrote {len(content)} bytes to {relative_path}"
 
 
-TOOLS = [write_file]
-llm_with_tools = llm.bind_tools(TOOLS)
-
-# Reserved filenames that must never be overwritten by generated code
-_PROTECTED_NAMES = {
-    "agent.py",
-    "main.py",
-    "architecture.md",
-    ".gitignore",
-}
-
-
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
 def _looks_like_json_blob(text: str) -> bool:
-    """True if text is (or is dominated by) a JSON object/array."""
     stripped = text.strip()
     if not (stripped.startswith("{") or stripped.startswith("[")):
         return False
@@ -87,30 +89,14 @@ def _looks_like_json_blob(text: str) -> bool:
         json.loads(stripped)
         return True
     except json.JSONDecodeError:
-        # Common: JSON wrapped in prose or slightly malformed — still treat as JSON-ish
-        return '"fixed_code"' in stripped or '"relative_path"' in stripped or '"name"' in stripped
-
-
-def _code_from_fences(text: str) -> str | None:
-    """Extract the largest fenced code block from markdown text."""
-    blocks = re.findall(r"```(?!json)(\w+)?\n(.*?)```", text, flags=re.DOTALL)
-    if not blocks:
-        # Fallback: any fence except pure json label handled below
-        blocks_plain = re.findall(r"```(?:\w+)?\n(.*?)```", text, flags=re.DOTALL)
-        if not blocks_plain:
-            return None
-        candidate = max(blocks_plain, key=len).strip()
-        return None if _looks_like_json_blob(candidate) else candidate
-    # blocks are (lang, body) tuples
-    bodies = [body.strip() for _, body in blocks if body.strip()]
-    if not bodies:
-        return None
-    candidate = max(bodies, key=len)
-    return None if _looks_like_json_blob(candidate) else candidate
+        return (
+            '"fixed_code"' in stripped
+            or '"relative_path"' in stripped
+            or '"approved"' in stripped
+        )
 
 
 def _parse_json_object(text: str) -> dict | None:
-    """Best-effort parse of a JSON object from raw or fenced text."""
     text = text.strip()
     fenced = re.search(r"```(?:json)?\n(.*?)```", text, flags=re.DOTALL)
     if fenced:
@@ -129,358 +115,308 @@ def _parse_json_object(text: str) -> dict | None:
             return None
 
 
-def _code_from_tool_json(text: str) -> tuple[str | None, str | None]:
-    """Unwrap source code (+ path) from a write_file-style JSON blob in chat text."""
-    data = _parse_json_object(text)
-    if not data:
-        return None, None
-
-    # {"name": "write_file", "arguments": {"relative_path": ..., "content": ...}}
-    if data.get("name") == "write_file" or "arguments" in data:
-        args = data.get("arguments") or data.get("args") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-        if isinstance(args, dict) and args.get("content"):
-            content = str(args["content"]).strip()
-            if content and not _looks_like_json_blob(content):
-                return content, args.get("relative_path")
-
-    # {"relative_path": "...", "content": "..."}
-    if data.get("content") and "relative_path" in data:
-        content = str(data["content"]).strip()
-        if content and not _looks_like_json_blob(content):
-            return content, data.get("relative_path")
-
-    return None, None
-
-
-def _code_from_review_json(text: str) -> str | None:
-    """Pull fixed_code from a reviewer JSON blob if present."""
-    data = _parse_json_object(text)
-    if not data:
+def _code_from_fences(text: str) -> str | None:
+    blocks = re.findall(r"```(?!json)(\w+)?\n(.*?)```", text, flags=re.DOTALL)
+    if not blocks:
         return None
-    fixed = data.get("fixed_code")
-    if not isinstance(fixed, str) or not fixed.strip():
+    bodies = [body.strip() for _, body in blocks if body.strip()]
+    if not bodies:
         return None
-    fixed = fixed.strip()
-    return None if _looks_like_json_blob(fixed) else fixed
+    candidate = max(bodies, key=len)
+    return None if _looks_like_json_blob(candidate) else candidate
 
 
-def extract_accepted_code(messages: list) -> tuple[str | None, str | None]:
-    """Find the best final code (+ optional path) from the conversation.
+def _sanitize_path(path: str) -> str:
+    path = path.strip().lstrip("./")
+    if Path(path).name.lower() in _PROTECTED_NAMES:
+        stem = Path(path).stem + "_app"
+        path = str(Path(path).with_name(stem + (Path(path).suffix or ".py")))
+    return path
 
-    Preference order:
-      1. Last write_file tool-call args (path + content)
-      2. write_file JSON embedded in AI text
-      3. Reviewer JSON ``fixed_code``
-      4. Largest markdown code fence in the latest AI messages
-    Never returns raw JSON / tool-call blobs as code.
-    """
-    for msg in reversed(messages):
-        for tc in getattr(msg, "tool_calls", None) or []:
-            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
-            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {}) or {}
-            if name == "write_file" and args.get("content"):
-                content = str(args["content"]).strip()
-                if content and not _looks_like_json_blob(content):
-                    return content, args.get("relative_path")
 
-    for msg in reversed(messages):
-        if getattr(msg, "type", "") != "ai":
+def _normalize_files(raw_files: Any) -> list[dict[str, str]]:
+    """Turn validator `files` into a clean list of {relative_path, content}."""
+    if not isinstance(raw_files, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    for item in raw_files:
+        if not isinstance(item, dict):
             continue
-        text = (getattr(msg, "content", None) or "").strip()
-        if not text:
-            continue
-
-        tool_code, tool_path = _code_from_tool_json(text)
-        if tool_code:
-            return tool_code, tool_path
-
-        from_json = _code_from_review_json(text)
-        if from_json:
-            return from_json, None
-
-        from_fence = _code_from_fences(text)
-        if from_fence:
-            return from_fence, None
-
-    return None, None
-
-
-def _conversation_digest(messages: list, limit: int = 12) -> str:
-    """Compact recent human/AI text for a finalize LLM call."""
-    parts: list[str] = []
-    for msg in messages:
-        msg_type = getattr(msg, "type", "")
-        content = (getattr(msg, "content", None) or "").strip()
-        if not content:
-            continue
-        if msg_type == "human":
-            parts.append(f"USER: {content}")
-        elif msg_type == "ai":
-            # Keep AI text but cap length so the finalize prompt stays small
-            clipped = content if len(content) <= 4000 else content[:4000] + "\n...[truncated]"
-            parts.append(f"ASSISTANT: {clipped}")
-    return "\n\n".join(parts[-limit:])
-
-
-_FINALIZE_SYSTEM = """You prepare accepted code for saving to disk.
-
-Return ONLY a JSON object (no markdown fences, no commentary) with this shape:
-{
-  "relative_path": "meaningful_name.ext",
-  "content": "<complete source code only>"
-}
-
-Rules for relative_path:
-- Intuitive name from the user's request (e.g. hello_world.py, fizzbuzz.py, todo_cli.py)
-- Correct extension for the language (.py, .js, .ts, .go, .rs, .java, etc.)
-- snake_case for Python; never use generated.py, output.py, or code.py
-- Do NOT use agent.py, main.py, or other project infrastructure names
-- Single file at project root unless a subdirectory clearly helps
-
-Rules for content:
-- Must be runnable source code in the target language — nothing else
-- Never JSON, never write_file tool calls, never review metadata, never markdown fences
-- No surrounding explanation"""
-
-
-def _finalize_with_llm(messages: list) -> tuple[str | None, str | None]:
-    """Ask the LLM for clean source code + a meaningful filename."""
-    digest = _conversation_digest(messages)
-    # Prefer any already-extracted pure source as a strong hint
-    hint_code, hint_path = extract_accepted_code(messages)
-    hint = ""
-    if hint_code:
-        hint = (
-            f"\n\nCandidate source code already extracted (may need cleanup; "
-            f"suggested path: {hint_path or 'unknown'}):\n{hint_code}"
-        )
-
-    prompt = [
-        {"role": "system", "content": _FINALIZE_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                "Conversation to finalize:\n\n"
-                f"{digest}"
-                f"{hint}\n\n"
-                "Produce the final JSON with relative_path and content now."
-            ),
-        },
-    ]
-
-    for _ in range(2):
-        response = llm.invoke(prompt)
-        text = getattr(response, "content", "") or ""
-        data = _parse_json_object(text)
-        if not data:
-            prompt.append({"role": "assistant", "content": text})
-            prompt.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Invalid response. Reply with ONLY JSON: "
-                        '{"relative_path": "...", "content": "..."} '
-                        "where content is pure source code."
-                    ),
-                }
-            )
-            continue
-
-        path = data.get("relative_path") or data.get("filename")
-        content = data.get("content")
+        path = item.get("relative_path") or item.get("path") or item.get("filename")
+        content = item.get("content") or item.get("code")
         if not isinstance(path, str) or not isinstance(content, str):
             continue
-        path = path.strip().lstrip("./")
+        path = _sanitize_path(path)
         content = content.strip()
-        # Strip accidental fences around content
         fenced = _code_from_fences(content)
         if fenced:
             content = fenced
         if not path or not content or _looks_like_json_blob(content):
-            prompt.append({"role": "assistant", "content": text})
-            prompt.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "content must be pure source code, not JSON. "
-                        "Pick a meaningful filename. Try again — JSON only."
-                    ),
-                }
-            )
             continue
-        if Path(path).name.lower() in _PROTECTED_NAMES:
-            stem = Path(path).stem + "_app"
-            path = str(Path(path).with_name(stem + Path(path).suffix))
-        return content, path
-
-    return None, None
+        cleaned.append({"relative_path": path, "content": content})
+    return cleaned
 
 
-def save_accepted_code(
-    messages: list,
-    relative_path: str | None = None,
-) -> str:
-    """Persist accepted code as real source (not JSON), with an intuitive name.
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+CODE_GEN_SYSTEM_PROMPT = """You are an expert software engineer working inside an autonomous agent loop.
 
-    Calls the LLM to finalize clean code + filename when needed.
-    """
-    code, inferred_path = _finalize_with_llm(messages)
+Your job:
+1. Implement the user's request as complete, runnable source code.
+2. If you see a message starting with [VALIDATOR], treat it as mandatory review feedback and revise the code to fix every issue.
+3. Do NOT write files to disk yourself — another step does that after approval.
+4. Prefer markdown fenced code blocks (```python ... ```) for each file.
+5. Clearly state the intended filename(s) (e.g. hello_world.py). Never use agent.py or main.py.
+6. Follow language best practices; include brief comments for non-obvious logic.
+7. Output ONLY the code (and short notes if needed) — no fake tool-call JSON."""
 
-    # Fallback: local extraction if the LLM finalize fails
-    if not code:
-        code, inferred_path = extract_accepted_code(messages)
-    if not code:
-        return "Error: could not produce clean source code to save."
+VALIDATE_SYSTEM_PROMPT = """You are a strict senior code reviewer validating an autonomous coding agent.
 
-    path = relative_path or inferred_path or "generated.py"
-    path = path.strip().lstrip("./")
-    if Path(path).name.lower() in _PROTECTED_NAMES:
-        path = f"{Path(path).stem}_app{Path(path).suffix or '.py'}"
+Judge whether the latest generated code fully and correctly satisfies the ORIGINAL user request.
 
-    if _looks_like_json_blob(code):
-        return (
-            "Error: refused to save JSON/tool-call blob as source code. "
-            "Try accepting again after refining."
-        )
+Return ONLY a JSON object (no markdown commentary outside JSON) with this shape:
 
-    return write_file.invoke({"relative_path": path, "content": code})
+If NOT approved:
+{
+  "approved": false,
+  "feedback": "Clear, actionable list of what to fix. Be specific.",
+  "files": []
+}
 
-# System prompt for the coding agent
-CODE_GEN_SYSTEM_PROMPT = """You are an expert software engineer. Your task is to write clean, correct, and well-commented code based on the user's description.
+If fully approved and ready to write to disk:
+{
+  "approved": true,
+  "feedback": "",
+  "files": [
+    {
+      "relative_path": "meaningful_name.ext",
+      "content": "<complete source code only — no fences, no JSON wrapper>"
+    }
+  ]
+}
 
 Rules:
-1. Ask clarifying questions if the request is ambiguous.
-2. Write complete, runnable code — do not omit key parts unless they are trivial boilerplate.
-3. Include inline comments explaining non-obvious logic.
-4. Follow community best practices for the language.
-5. Prefer showing the code in a markdown fenced code block (```python ... ```) so it is easy to read.
-6. Choose an intuitive filename when discussing the file (e.g. hello_world.py). Do NOT overwrite agent.py or main.py.
-7. If you use the write_file tool, put ONLY source code in the content argument — never JSON, never tool-call text.
-
-If asked to fix or improve existing code, show the full corrected version."""
+- approved=true ONLY if the code is correct, complete, and meets the request.
+- When approved, files[].content MUST be pure source code for that language.
+- Choose intuitive filenames (hello_world.py, show_time.py). Correct extensions.
+- Never use agent.py, main.py, architecture.md, or agent.md as paths.
+- Prefer a single file unless multiple files are clearly required.
+- If code is missing, broken, or incomplete → approved=false with precise feedback."""
 
 
 # ---------------------------------------------------------------------------
-# State types
+# State
 # ---------------------------------------------------------------------------
 class AgentState(MessagesState, total=False):
-    """LangGraph state extending MessagesState with status tracking."""
+    """Graph state: chat history + validation outcome."""
 
-    status: str  # "generating" | "reviewing" | "fixed" | "done"
+    status: str  # generating | validating | revising | writing | done | failed
+    approved: bool
+    feedback: str
+    files: list  # [{relative_path, content}, ...]
+    iteration: int
+    write_results: list  # status strings from write_file
 
 
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
 def generate_code(state: AgentState) -> AgentState:
-    """First pass: generate code from the user's request (may call tools)."""
+    """Produce or revise code. Does not write files."""
     messages = [
         {"role": "system", "content": CODE_GEN_SYSTEM_PROMPT},
         *state["messages"],
     ]
-    response = llm_with_tools.invoke(messages)
+    response = llm.invoke(messages)
+    iteration = int(state.get("iteration") or 0)
     return {
         "messages": [response],
-        "status": "generating",
+        "status": "generating" if iteration == 0 else "revising",
+        "approved": False,
     }
 
 
-def review_code(state: AgentState) -> AgentState:
-    """Second pass: review generated code and suggest improvements."""
-    system_review = """You are a senior code reviewer. Review the code carefully for:
-- Bugs, logical errors, or edge-case failures
-- Missing error handling
-- Performance issues
-- Style / readability problems
-
-Respond with a short review, then the corrected code in a markdown fenced block
-(e.g. ```python ... ```). The fenced block must contain ONLY source code —
-no JSON, no tool-call objects, no explanations inside the fence.
-
-If the code is already fine, still repeat the final source code in a fence."""
+def validate_code(state: AgentState) -> AgentState:
+    """LLM validates latest code. Approves + provides files, or returns feedback."""
+    iteration = int(state.get("iteration") or 0) + 1
 
     messages = [
-        {"role": "system", "content": system_review},
+        {"role": "system", "content": VALIDATE_SYSTEM_PROMPT},
         *state["messages"],
+        {
+            "role": "user",
+            "content": (
+                "Validate the code against the original user request. "
+                "Reply with ONLY the JSON object described in your instructions."
+            ),
+        },
     ]
-    response = llm_with_tools.invoke(messages)
+
+    raw = ""
+    data: dict | None = None
+    for attempt in range(2):
+        response = llm.invoke(messages)
+        raw = getattr(response, "content", "") or ""
+        data = _parse_json_object(raw)
+        if data is not None and "approved" in data:
+            break
+        messages.append({"role": "assistant", "content": raw})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    'Invalid. Reply with ONLY JSON including "approved" (boolean), '
+                    '"feedback" (string), and "files" (array).'
+                ),
+            }
+        )
+
+    if data is None or "approved" not in data:
+        feedback = (
+            "Validator returned unparseable output. Regenerate the full solution "
+            "clearly in markdown fences with an explicit filename."
+        )
+        note = HumanMessage(
+            content=(
+                f"[VALIDATOR] approved=false (iteration {iteration}/{MAX_REVISIONS})\n"
+                f"Feedback:\n{feedback}"
+            )
+        )
+        return {
+            "messages": [AIMessage(content=raw or "(empty validator response)"), note],
+            "status": "validating",
+            "approved": False,
+            "feedback": feedback,
+            "files": [],
+            "iteration": iteration,
+        }
+
+    approved = bool(data.get("approved"))
+    feedback = str(data.get("feedback") or "").strip()
+    files = _normalize_files(data.get("files"))
+
+    # Approved but missing/invalid files → treat as not approved
+    if approved and not files:
+        approved = False
+        feedback = (
+            feedback
+            or "Approved flag was set but no valid source files were provided. "
+            "Return approved=true with a files array of pure source code."
+        )
+
+    if approved:
+        summary = (
+            f"[VALIDATOR] approved=true (iteration {iteration}/{MAX_REVISIONS})\n"
+            f"Ready to write {len(files)} file(s): "
+            + ", ".join(f["relative_path"] for f in files)
+        )
+        return {
+            "messages": [AIMessage(content=summary)],
+            "status": "writing",
+            "approved": True,
+            "feedback": "",
+            "files": files,
+            "iteration": iteration,
+        }
+
+    if not feedback:
+        feedback = "Code is not yet acceptable. Improve correctness and completeness."
+
+    note = HumanMessage(
+        content=(
+            f"[VALIDATOR] approved=false (iteration {iteration}/{MAX_REVISIONS})\n"
+            f"Feedback:\n{feedback}\n\n"
+            "Revise the FULL solution addressing every point. "
+            "Do not write files yet — output updated code in fences."
+        )
+    )
     return {
-        "messages": [response],
-        "status": "reviewing",
+        "messages": [AIMessage(content=raw), note],
+        "status": "validating",
+        "approved": False,
+        "feedback": feedback,
+        "files": [],
+        "iteration": iteration,
     }
 
 
-def ask_user(state: AgentState) -> AgentState:
-    """Pause — wait for user feedback after code generation + review."""
-    # Append a system message reminding the user to provide feedback
+def write_files(state: AgentState) -> AgentState:
+    """Persist approved files to disk via write_file."""
+    files = state.get("files") or []
+    results: list[str] = []
+    for item in files:
+        path = item.get("relative_path", "")
+        content = item.get("content", "")
+        result = write_file.invoke({"relative_path": path, "content": content})
+        results.append(result)
+
+    if not results:
+        results = ["Error: no files to write."]
+
+    done_msg = AIMessage(
+        content="📝 Write results:\n" + "\n".join(f"- {r}" for r in results)
+    )
+    status = "done" if all(r.startswith("Successfully") for r in results) else "failed"
     return {
-        "messages": [],  # don't add; we handle this in main.py
-        "status": "pending_feedback",
+        "messages": [done_msg],
+        "status": status,
+        "write_results": results,
     }
 
 
+def fail_max_revisions(state: AgentState) -> AgentState:
+    """Stop after too many revision rounds without approval."""
+    feedback = state.get("feedback") or "unknown issues"
+    msg = AIMessage(
+        content=(
+            f"❌ Stopped after {MAX_REVISIONS} revision(s) without approval.\n"
+            f"Last validator feedback:\n{feedback}"
+        )
+    )
+    return {"messages": [msg], "status": "failed", "approved": False}
+
+
 # ---------------------------------------------------------------------------
-# Router
+# Routers
 # ---------------------------------------------------------------------------
-def after_generate(state: AgentState) -> Literal["tools", "review_code"]:
-    """After generation: run tools if the model requested them, else review."""
-    last_msg = state["messages"][-1] if state["messages"] else None
-    if last_msg and getattr(last_msg, "tool_calls", None):
-        return "tools"
-    return "review_code"
-
-
-def after_review(state: AgentState) -> Literal["tools", "ask_user"]:
-    """After review: run tools if requested (e.g. write fixed files), else ask user."""
-    last_msg = state["messages"][-1] if state["messages"] else None
-    if last_msg and getattr(last_msg, "tool_calls", None):
-        return "tools"
-    return "ask_user"
-
-
-def after_tools(state: AgentState) -> Literal["generate_code", "ask_user"]:
-    """After tools run: continue generating, or finish review → ask user."""
-    if state.get("status") == "reviewing":
-        return "ask_user"
+def after_validate(state: AgentState) -> Literal["write_files", "generate_code", "fail_max_revisions"]:
+    if state.get("approved") and state.get("files"):
+        return "write_files"
+    if int(state.get("iteration") or 0) >= MAX_REVISIONS:
+        return "fail_max_revisions"
     return "generate_code"
 
 
 # ---------------------------------------------------------------------------
-# Build graph
+# Graph
 # ---------------------------------------------------------------------------
 workflow = StateGraph(AgentState)
 
-# Add nodes
 workflow.add_node("generate_code", generate_code)
-workflow.add_node("review_code", review_code)
-workflow.add_node("ask_user", ask_user)
-workflow.add_node("tools", ToolNode(TOOLS))
+workflow.add_node("validate_code", validate_code)
+workflow.add_node("write_files", write_files)
+workflow.add_node("fail_max_revisions", fail_max_revisions)
 
-# Set entry point
 workflow.set_entry_point("generate_code")
 
-# Edges: generate ↔ tools → review → (tools?) → ask_user
+workflow.add_edge("generate_code", "validate_code")
 workflow.add_conditional_edges(
-    "generate_code",
-    after_generate,
-    {"tools": "tools", "review_code": "review_code"},
+    "validate_code",
+    after_validate,
+    {
+        "write_files": "write_files",
+        "generate_code": "generate_code",
+        "fail_max_revisions": "fail_max_revisions",
+    },
 )
-workflow.add_conditional_edges(
-    "review_code",
-    after_review,
-    {"tools": "tools", "ask_user": "ask_user"},
-)
-workflow.add_conditional_edges(
-    "tools",
-    after_tools,
-    {"generate_code": "generate_code", "ask_user": "ask_user"},
-)
+workflow.add_edge("write_files", END)
+workflow.add_edge("fail_max_revisions", END)
 
-# compile with memory checkpointing
 memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
+
+
+def new_thread_id() -> str:
+    """Fresh thread per project request so runs don't pollute each other."""
+    return f"run-{uuid.uuid4().hex[:12]}"

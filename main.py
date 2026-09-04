@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-CLI entry point for the AI code-writing agent.
+CLI entry point for the autonomous AI coding agent.
 
 Usage:
     .env/bin/python main.py
 
-Interactively receives user input describing the code they want,
-then runs the LangGraph agent (agent.py) to generate / review / iterate on it.
+Describe what you want once. The agent generates code, validates it with the
+LLM, revises until approved, writes files, then finishes — no manual accept.
 """
 
 import sys
 
-from agent import app, save_accepted_code
+from agent import MAX_REVISIONS, app, new_thread_id
 
 
-def read_user_input(prompt: str = "What would you like to build? ", label: str = "") -> str:
-    """Prompt the user for a text input on stdin/stdout."""
-    if label:
-        prompt = f"{label}: {prompt}"
+def read_user_input(prompt: str = "What would you like to build? ") -> str:
     try:
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
@@ -25,85 +22,77 @@ def read_user_input(prompt: str = "What would you like to build? ", label: str =
         sys.exit(0)
 
 
-def print_code(code: str) -> None:
-    """Print generated/reviewed code with markdown code-fence styling."""
-    print("\n```python\n" + code.strip() + "\n```\n")
-
-
-def display_new_messages(messages: list, start_index: int) -> None:
-    """Print assistant/tool messages produced since start_index."""
-    for msg in messages[start_index:]:
-        msg_type = getattr(msg, "type", "")
-        content = getattr(msg, "content", None)
-        if not content or not str(content).strip():
-            continue
-        text = str(content).strip()
-        if msg_type == "ai":
-            print(text)
-            print()
-        elif msg_type == "tool":
-            print(f"🔧 {text}\n")
-
-
 def run_agent() -> None:
-    """Main loop — drive the LangGraph agent from user input."""
-    config = {"configurable": {"thread_id": "default-thread"}}
-    displayed_upto = 0
-
+    """Ask for a task, run the autonomous loop until files are written (or fail)."""
     while True:
-        # Read initial request or feedback
-        user_input = read_user_input("Describe the code you want (or type 'quit' to exit): ")
+        user_input = read_user_input(
+            "Describe the code you want (or type 'quit' to exit): "
+        )
 
         if user_input.lower() in ("quit", "exit", "q"):
             print("\nBye!")
             break
 
-        if not user_input.strip():
+        if not user_input:
             continue
 
-        # --- First interaction: start fresh graph run ---
-        print("\n⏳ Generating code...\n")
+        config = {
+            "configurable": {"thread_id": new_thread_id()},
+            "recursion_limit": max(50, MAX_REVISIONS * 4 + 10),
+        }
 
-        result = app.invoke(
-            {"messages": [("user", user_input)]},
+        print("\n⏳ Autonomous run: generate → validate → revise → write files\n")
+        print(f"(max {MAX_REVISIONS} revision rounds)\n")
+
+        for update in app.stream(
+            {
+                "messages": [("user", user_input)],
+                "iteration": 0,
+                "approved": False,
+                "files": [],
+                "feedback": "",
+                "status": "starting",
+            },
             config=config,
-        )
+            stream_mode="updates",
+        ):
+            for node_name, partial in update.items():
+                print(f"—— {node_name} ——")
+                for msg in partial.get("messages") or []:
+                    msg_type = getattr(msg, "type", "")
+                    content = (getattr(msg, "content", None) or "").strip()
+                    if not content:
+                        continue
+                    if msg_type == "ai":
+                        print(content)
+                        print()
+                    elif msg_type == "human" and content.startswith("[VALIDATOR]"):
+                        print(f"🔎 {content}\n")
 
-        display_new_messages(result["messages"], start_index=displayed_upto)
-        displayed_upto = len(result["messages"])
-        print(f"📋 Status: {result.get('status', 'unknown')}\n")
+                status = partial.get("status")
+                iteration = partial.get("iteration")
+                approved = partial.get("approved")
+                if status is not None:
+                    extra = f"status={status}"
+                    if iteration is not None:
+                        extra += f", iteration={iteration}"
+                    if approved is not None:
+                        extra += f", approved={approved}"
+                    print(f"📋 {extra}\n")
 
-        # After generate + review, ask user for feedback or acceptance
-        while True:
-            feedback = read_user_input(
-                "Review the output above. Type feedback to refine, or 'accept' to finish:",
-                label="[USER]",
-            ).strip()
+        final_state = app.get_state(config).values
+        status = final_state.get("status", "unknown")
+        write_results = final_state.get("write_results") or []
 
-            if feedback.lower() == "accept":
-                print("\n💾 Finalizing clean source and saving...\n")
-                outcome = save_accepted_code(result["messages"])
-                print(f"🔧 {outcome}\n")
-                if outcome.startswith("Error"):
-                    print("❌ Save failed. You can type feedback to refine, or 'accept' to retry.\n")
-                    continue
-                print("✅ Code accepted and saved.\n")
-                break
-
-            if feedback.lower() in ("quit", "exit", "q"):
-                print("\nBye!")
-                sys.exit(0)
-
-            # Feed feedback back into the graph
-            print("\n🔄 Refining code based on your feedback...\n")
-            result = app.invoke(
-                {"messages": [("user", f"[USER] {feedback}")]},
-                config=config,
-            )
-
-            display_new_messages(result["messages"], start_index=displayed_upto)
-            displayed_upto = len(result["messages"])
-            print(f"📋 Status: {result.get('status', 'unknown')}\n")
+        if status == "done":
+            print("✅ Project finished. Files written:")
+            for line in write_results:
+                print(f"   • {line}")
+            print()
+        elif status == "failed":
+            print("❌ Agent stopped without writing files.\n")
+        else:
+            print(f"📋 Finished with status: {status}\n")
 
 
 if __name__ == "__main__":
