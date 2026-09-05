@@ -2,9 +2,11 @@
 
 ## 1. Overview
 
-A LangGraph-powered agentic CLI that iteratively generates, reviews, and refines code using a local Ollama instance (default model `qwen2.5-coder:7b`). The user describes desired code via the terminal; the agent loops through generation and review stages, pausing for feedback until the user accepts the output or exits.
+A LangGraph-powered **autonomous** coding CLI that uses a local Ollama instance (default model `qwen2.5-coder:7b`). The user describes desired code once via the terminal; the agent plans (optionally), reasons, generates code, validates it with the LLM, revises until approved, writes files to disk, and finishes — with no manual accept step.
 
-**Repository root:** `/Users/abuhaidersiddiq/codes/playground/local_coding_agent`
+The active agent implementation is **`agent2.py`** (ReAct + planning + tool framework). **`agent.py`** remains as a simpler fixed-loop alternative.
+
+**Repository root:** `local_coding_agent/`
 
 ---
 
@@ -13,20 +15,22 @@ A LangGraph-powered agentic CLI that iteratively generates, reviews, and refines
 ```
 local_coding_agent/
 ├── .env/                 # Python virtual environment (venv)
-│   ├── bin/              # Executables (python, pip)
-│   └── lib/              # Installed site-packages
-├── __pycache__/          # Compiled Python bytecode cache
-├── .gitignore            # Git ignore rules
-├── .git/                 # Git repository metadata
-├── agent.py              # LangGraph state graph, nodes, and edge routers
-└── main.py               # CLI entry point – interactive user loop
+├── agent.py              # Simple autonomous agent (generate → validate loop)
+├── agent2.py             # ReAct agent — wired to main.py
+├── agent.md              # Guide for agent.py
+├── agent2.md             # Guide for agent2.py
+├── main.py               # CLI entry point (streams agent2 graph)
+├── ARCHITECTURE.md       # This file
+└── .gitignore
 ```
 
-| File | Size | Purpose |
-|---|---|---|
-| `agent.py` | ~4.8 KB | Defines the `AgentState` schema, LLM wiring (`ChatOllama`), three workflow nodes (`generate_code`, `review_code`, `ask_user`), two routing functions, and compiles the `StateGraph`. |
-| `main.py` | ~2.7 KB | Interactive CLI driver: reads stdin prompts, calls `app.invoke()` with threaded checkpoint state, handles accept/feedback/quit logic. |
-| `.env/` | venv dir | Isolated Python 3.14 virtualenv with all dependencies pre-installed. |
+| File | Purpose |
+|------|---------|
+| `agent2.py` | ReAct LangGraph: plan → reason → act → observe; tools, retries, escalation |
+| `agent.py` | Simpler graph: `generate_code` → `validate_code` → write / revise / fail |
+| `main.py` | Reads one task, streams `agent2.app`, prints progress and final result |
+| `agent2.md` | Detailed explanation of `agent2.py` |
+| `agent.md` | Detailed explanation of `agent.py` |
 
 ---
 
@@ -34,203 +38,215 @@ local_coding_agent/
 
 ```
 ┌─────────────┐       ┌──────────────────┐       ┌─────────────────┐
-│  main.py    │──────▶│   agent.py       │──────▶│  ChatOllama     │
-│             │  invoke│                  │  llm   │  (Localhost:114 │
-│  • read UI  │◀──────│  StateGraph      │invoke │   34) / qwen2.5 │
-│  • loop     │  state │  (CompiledApp)  │        │  -coder:7b      │
-│  • print    │        │                  │        │                 │
+│  main.py    │──────▶│   agent2.py      │──────▶│  ChatOllama     │
+│             │ stream│                  │ invoke│  (localhost:    │
+│  • read UI  │◀──────│  StateGraph      │       │   11434)        │
+│  • stream   │ state │  (ReAct loop)    │       │  qwen2.5-coder  │
+│  • summary  │       │                  │       │  :7b            │
 └─────────────┘       └────────┬─────────┘       └─────────────────┘
                                │
                     ┌──────────▼──────────┐
                     │ MemorySaver         │
-                    │ (in-memory check-   │
-                    │  pointer per thread)│
+                    │ (per-thread state)  │
+                    └─────────────────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │ write_file /        │
+                    │ read_file tools     │
+                    │ (project sandbox)   │
                     └─────────────────────┘
 ```
 
 ---
 
-## 4. Data Flow
+## 4. Data Flow (`agent2.py`)
 
-### 4.1 Initial Code Generation Cycle
-
-```
-User ──► Describe code ──► main.py ──► app.invoke({"messages": [("user", "...")]})
-                                                                       │
-                                            Entry point: generate_code
-                                                                       │
-                                              Prepend system prompt + msgs
-                                                       │
-                                               llm.invoke()
-                                                        │
-                                                   Assistant responds
-                                                        │
-                                          Return {messages, status="generating"}
-                                                        │
-                                   Router should_continue → "review_code"
-                                                        │
-                                       Prepend review system prompt + msgs
-                                                │
-                                           llm.invoke()
-                                                    │
-                                             Reviewer responds
-                                                    │
-                                Router continue_or_end → "ask_user"
-                                                        │
-                                          Return {messages, status="pending_feedback"}
-```
-
-### 4.2 Feedback Loop
+### 4.1 Successful path
 
 ```
-User types feedback ──► "[USER] <feedback>" ──► main.py invokes app again
-                                                         │
-                                                 Same thread_id (persisted state)
-                                                         │
-                                              Entry: generate_code (restarts)
-                                                         │
-                                               Model sees full history
-                                                        │
-                                                  Refined code generated
-                                                        │
-                                     Auto-review → ask_user → back to CLI loop
+User describes task
+    → main.py streams agent2.app
+    → create_plan (optional, PLAN_MODE=plan_and_execute)
+    → reason (pick action)
+    → generate_code (LLM writes/revises code in chat)
+    → observe
+    → reason → validate_code (LLM returns JSON: approved / feedback / files)
+    → observe
+    → [if not approved] reason → generate_code → validate_code … (bounded by MAX_REVISIONS)
+    → [if approved] reason → write_files (write_file tool, sequential)
+    → observe → status=done → END
+    → main.py prints written file paths
 ```
 
-### 4.3 Exit Paths
+### 4.2 ReAct loop
 
-| Condition           | Action                |
-|---------------------|-----------------------|
-| User types `accept` | Print success, break  |
-| User types `quit`   | Print bye, exit(0)    |
-| KeyboardInterrupt   | Catch, print bye, exit(0) |
+Each step follows:
+
+| Phase | Node | Role |
+|-------|------|------|
+| Reason | `reason` | Choose next action from state |
+| Act | `generate_code` / `validate_code` / `write_files` | Execute action |
+| Observe | `observe` | Record result; advance plan index |
+
+### 4.3 Exit paths
+
+| Condition | Status | Action |
+|-----------|--------|--------|
+| Validator approves + files written | `done` | CLI prints success + paths |
+| Max revisions / steps / repeated actions | `escalated` | CLI suggests human review |
+| LLM or tool hard failure | `failed` | CLI prints error reason |
+| User types `quit` | — | Exit CLI |
+
+There is **no** user feedback or `accept` loop in `main.py`.
 
 ---
 
-## 5. LangGraph State Machine
+## 5. LangGraph State Machine (`agent2.py`)
 
-### 5.1 State Schema
+### 5.1 State schema
 
 ```python
 class AgentState(MessagesState, total=False):
-    """Extends MessagesState with custom status tracking."""
-    status: str  # "generating" | "reviewing" | "fixed" | "done"
+    status: str
+    approved: bool
+    feedback: str
+    files: list[dict[str, str]]
+    iteration: int
+    step_count: int
+    revision_count: int
+    action_history: list[str]
+    observations: list[str]
+    last_observation: str
+    current_action: str
+    plan: list[str]
+    plan_index: int
+    write_results: list[str]
+    escalation_reason: str
 ```
 
-`MessagesState` (from LangGraph) provides an auto-reducing `messages` channel that appends each new message as it's returned from nodes.
+`MessagesState` appends messages returned from each node.
 
 ### 5.2 Nodes
 
-| Node | Input | Action | Output |
-|---|---|---|---|
-| `generate_code` | `state["messages"]` | Prepends `CODE_GEN_SYSTEM_PROMPT`, calls `llm.invoke()` | Append assistant response, set `status="generating"` |
-| `review_code` | `state["messages"]` | Prepends `system_review` (JSON-output instructions), calls `llm.invoke()` | Append reviewer response, set `status="reviewing"` |
-| `ask_user` | none meaningful | Does not modify messages | Set `status="pending_feedback"` |
+| Node | Action |
+|------|--------|
+| `create_plan` | Optional bounded plan (`plan_and_execute` mode) |
+| `reason` | ReAct: select `generate_code`, `validate_code`, `write_files`, or `escalate` |
+| `generate_code` | LLM produces/revises source (markdown fences) |
+| `validate_code` | LLM returns approval JSON + file payloads or feedback |
+| `write_files` | Persist approved files via `write_file` tool |
+| `observe` | Store observation; advance plan |
+| `escalate` | Human escalation terminal node |
+| `fail` | Hard failure terminal node |
 
-### 5.3 Conditional Edges
+### 5.3 Routers
 
-| From | Router Function | Logic | Registered Targets |
-|---|---|---|---|
-| `generate_code` | `should_continue` | If last message content starts with `"[USER]"` → `"generate_code"`; else → `"review_code"` | `{"review_code", "__end__"}` |
-| `review_code` | `continue_or_end` | Always returns `"ask_user"` | `{"ask_user", "__end__"}` |
+| From | Router | Targets |
+|------|--------|---------|
+| `reason` | `after_reason` | `generate_code`, `validate_code`, `write_files`, `escalate`, `fail` |
+| act nodes | `after_act` | `observe`, `escalate`, `fail` |
+| `observe` | `after_observe` | `reason`, `escalate`, `fail`, `END` |
 
-### 5.4 Graph Wiring
+### 5.4 Graph wiring
 
 ```
-[generate_code] ──conditional(should_continue)──▶ [review_code] ──conditional(continue_or_end)──▶ [ask_user]
-      ▲                                                                          │
-      │__________________________________________________________________________│
-                         (implicit: feedback re-invokes graph from entry point)
+create_plan → reason ⟷ (generate | validate | write) → observe
+                              ↓
+                         escalate / fail → END
+                              ↓
+                    observe → END (when done)
 ```
 
-Entry point: **`generate_code`**.  
-Checkpointer: **`MemorySaver()`** — thread-scoped in-memory message history.
+Entry point: **`create_plan`**.  
+Checkpointer: **`MemorySaver()`** — fresh `thread_id` per task from `new_thread_id()`.
 
 ---
 
 ## 6. Configuration
 
-All configuration is sourced from the environment (via `dotenv`).
+Environment variables (via `dotenv`):
 
 | Variable | Default | Description |
-|---|---|---|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | URL where the local Ollama server listens |
-| `MODEL_NAME` | `qwen2.5-coder:7b` | HuggingFace-style model identifier passed to Ollama |
-| `temperature` | `0.2` | Hardcoded in `ChatOllama` init — low for deterministic code output |
+|----------|---------|-------------|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `MODEL_NAME` | `qwen2.5-coder:7b` | Model identifier |
+| `PLAN_MODE` | `reactive` | `reactive` or `plan_and_execute` |
+| `MAX_REVISIONS` | `6` | Max validate→revise cycles |
+| `MAX_STEPS` | `12` | Max ReAct reason steps |
+| `MAX_TOOL_RETRIES` | `3` | LLM/tool retry attempts |
+| `MAX_VALIDATOR_ATTEMPTS` | `2` | Retries for malformed validator JSON |
+| `MAX_REPEATED_ACTIONS` | `3` | Loop detection threshold |
+| `LLM_TIMEOUT_SECONDS` | `120` | Ollama request timeout |
+| `RETRY_BASE_SECONDS` | `1.0` | Exponential backoff base |
+| `RETRY_MAX_SECONDS` | `8.0` | Backoff cap |
 
-No `.env` file is shipped with the repo; create one if you need to override defaults.
-
----
-
-## 7. External Dependencies
-
-| Package | Version | Role |
-|---|---|---|
-| `langgraph` | latest | Core orchestration: `StateGraph`, `END`, conditional edges |
-| `langchain-core` | latest | Foundation abstractions (messages, prompts) used by langgraph |
-| `langchain-ollama` | latest | Bridge between LangChain and Ollama HTTP API |
-| `ollama` (Python SDK) | latest | Lightweight Ollama client library (transitive dep) |
-| `langgraph-checkpoint` | latest | Base checkpointer protocol |
-| `langgraph-prebuilt` | latest | Pre-built agent utilities |
-| `langgraph-sdk` | latest | SDK extras for distributed features |
-| `python-dotenv` | latest | Load `.env` into `os.environ` |
-| `pydantic` | latest | Data validation (LangGraph internal dependency) |
-
-**Required external service:** A running Ollama instance (`ollama serve`) with the model pulled (`ollama pull qwen2.5-coder:7b`).
+Temperature is hardcoded to `0.2` in `ChatOllama` for deterministic output.
 
 ---
 
-## 8. Execution Environment
+## 7. Tools & safety
 
-- **Host OS:** macOS
-- **Shell:** zsh
-- **Python version:** 3.14.x (managed inside `.env/` virtualenv)
-- **Runner command:** `.env/bin/python main.py`
-- **Threading:** All sessions share `thread_id = "default-thread"`. Each `app.invoke()` call resumes state from the same thread, accumulating message history across iterations.
+| Tool | Purpose |
+|------|---------|
+| `write_file` | Write approved source under `PROJECT_ROOT` |
+| `read_file` | Read project files safely (for future use) |
+
+Safety:
+
+- Path traversal blocked (`../` escapes rejected)
+- Protected files cannot be overwritten: `agent.py`, `main.py`, `architecture.md`, `agent.md`, `.gitignore`
+- Tool arguments validated with Pydantic before execution
+- Writes run sequentially to avoid ordering conflicts
 
 ---
 
-## 9. Identified Issues & Known Gaps
+## 8. External Dependencies
 
-### Issue 1 — Generated code never displayed to the user
+| Package | Role |
+|---------|------|
+| `langgraph` | `StateGraph`, `END`, conditional edges, checkpointing |
+| `langchain-core` | Messages, tools |
+| `langchain-ollama` | `ChatOllama` bridge |
+| `pydantic` | Tool schemas, `ToolCall` validation |
+| `python-dotenv` | Load `.env` |
 
-The `print_code(code)` helper function exists in `main.py` but is **never called** inside `run_agent()`. The extracted `content` variable holds the assistant's response but is only logged via the status line:
+**Required service:** Ollama running locally with the model pulled:
 
-```python
-print(f"\n📋 Status: {result.get('status', 'unknown')}")
+```bash
+ollama serve
+ollama pull qwen2.5-coder:7b
 ```
 
-The user never sees the actual generated or reviewed code. This is a cosmetic bug that blocks usability.
+---
 
-### Issue 2 — `should_continue` router has type mismatch and unregistered edge
+## 9. Execution
 
-```python
-def should_continue(state: AgentState) -> Literal["review_code", "__end__"]:
-    ...
-    return "generate_code"    # ← NOT in registered targets!
+```bash
+.env/bin/python main.py
 ```
 
-- The return annotation claims `Literal["review_code", "__end__"]` but the body can return `"generate_code"`.
-- The registered edge map `{"review_code": "review_code", "__end__": "__end__"}` does not include `"generate_code"`.
-- Furthermore, this branch is effectively unreachable: `should_continue` is evaluated right after `generate_code` executes, so the last message is always the LLM's response (which never starts with `"[USER]"`). When user feedback arrives, it triggers a **fresh** `app.invoke()` that hits the entry point rather than transitioning within the existing graph.
-
-### Issue 3 — `continue_or_end` always hardcodes `"ask_user"`
-
-```python
-def continue_or_end(state: AgentState) -> Literal["ask_user", "__end__"]:
-    return "ask_user"
-```
-
-This is currently acceptable because the review node should always be followed by asking for user feedback. However, the hardcoded behavior means there is no mechanism for the reviewer to signal that the code is correct and no further iteration is needed (i.e., the graph can never short-circuit to `"__end__"` based on the review result).
+- One task per run; fresh `thread_id` per invocation
+- Progress streamed node-by-node (`stream_mode="updates"`)
+- `recursion_limit` scaled to `MAX_STEPS` for ReAct depth
 
 ---
 
-## 10. Recommendation Summary
+## 10. `agent.py` vs `agent2.py`
 
-| Priority | Area | Suggestion |
-|---|---|---|
-| **High** | CLI output | Call `print_code(content)` after `app.invoke()` results so users see the generated code. |
-| **Medium** | Router types | Fix `should_continue`'s return type literal and add `"generate_code": "generate_code"` to the target map if the self-loop is intentional. |
-| **Medium** | Short-circuit review | Make `continue_or_end` inspect the review response to allow early `"__end__"` termination when no issues are found. |
-| **Low** | Structured output | Use `llm.with_structured_output(...)` in `review_code` instead of raw-text JSON prompting for guaranteed schema compliance. |
-| **Low** | Error handling | Wrap `app.invoke()` in try/except to handle missing Ollama connection gracefully. |
-| **Low** | Session isolation | Consider deriving `thread_id` from user input or time-stamping it to support parallel conversations. |
+| Aspect | `agent.py` | `agent2.py` |
+|--------|-----------|-------------|
+| Pattern | Fixed generate → validate | ReAct reason → act → observe |
+| Planning | No | Optional `plan_and_execute` |
+| Tools | `write_file` direct | Pydantic tools + execution framework |
+| Retries | Validator JSON only | LLM + tool backoff |
+| Failure | `fail_max_revisions` | `escalate` + `fail` + loop detection |
+| Used by `main.py` | No (legacy) | **Yes** |
+
+Use `agent.py` for a minimal learning example; use `agent2.py` for the full autonomous CLI experience.
+
+---
+
+## 11. Further reading
+
+- [`agent2.md`](agent2.md) — line-by-line concepts and walkthrough for `agent2.py`
+- [`agent.md`](agent.md) — guide for the simpler `agent.py`
