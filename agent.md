@@ -406,6 +406,6 @@ If the validator never approves within 6 rounds → `fail_max_revisions` → END
 4. Validator JSON shape + `_normalize_files`  
 5. `write_files` + path safety  
 6. Skim `main.py` streaming loop  
-7. Trace one real run with `.env/bin/python main.py`
+7. Trace one real run with `.venv/bin/python main.py`
 
 Once those click, the file is: **generate, judge, revise, then write.**

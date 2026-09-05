@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
 """
-CLI entry point for the autonomous ReAct coding agent (agent2).
+CLI entry point for the autonomous ReAct coding agent (AI Doer / gpt-4o).
 
-Usage:
-    .env/bin/python main.py
+Usage (use the project venv — NOT plain `python` unless .venv is activated):
+    source .venv/bin/activate
+    python main.py
 
-Describe what you want once. The agent plans (optionally), reasons, generates,
-validates, revises until approved, writes files, then finishes — no manual accept.
+    # or without activating:
+    .venv/bin/python main.py
+
+Requires AI_DOER_API_KEY in your environment or .env file.
 """
 
 import sys
 
-from agent2 import MAX_REVISIONS, MAX_STEPS, PLAN_MODE, app, new_thread_id
+try:
+    from agent_ai_doer import MAX_REVISIONS, MAX_STEPS, MODEL_NAME, PLAN_MODE, app, new_thread_id
+except ModuleNotFoundError as exc:
+    missing = exc.name or "a dependency"
+    print("Missing Python package:", missing, file=sys.stderr)
+    print(file=sys.stderr)
+    print("You are probably not using the project virtualenv (.venv).", file=sys.stderr)
+    print("Fix:", file=sys.stderr)
+    print("  deactivate          # exit any old (.env) venv", file=sys.stderr)
+    print("  source .venv/bin/activate", file=sys.stderr)
+    print("  pip install -r requirements.txt", file=sys.stderr)
+    print("  python main.py", file=sys.stderr)
+    print(file=sys.stderr)
+    print("Or run directly:", file=sys.stderr)
+    print("  .venv/bin/python main.py", file=sys.stderr)
+    sys.exit(1)
 
 
 def read_user_input(prompt: str = "What would you like to build? ") -> str:
@@ -22,8 +40,12 @@ def read_user_input(prompt: str = "What would you like to build? ") -> str:
         sys.exit(0)
 
 
-def _print_partial_state(partial: dict) -> None:
+def _print_partial_state(partial: dict | None) -> None:
     """Print messages and key state fields from a streamed node update."""
+    if not partial:
+        print("(no state change)\n")
+        return
+
     for msg in partial.get("messages") or []:
         msg_type = getattr(msg, "type", "")
         content = (getattr(msg, "content", None) or "").strip()
@@ -50,10 +72,13 @@ def _print_partial_state(partial: dict) -> None:
     revision_count = partial.get("revision_count")
     approved = partial.get("approved")
     escalation_reason = partial.get("escalation_reason")
+    output_dir = partial.get("output_dir")
 
     parts: list[str] = []
     if status is not None:
         parts.append(f"status={status}")
+    if output_dir:
+        parts.append(f"output_dir={output_dir}")
     if action:
         parts.append(f"action={action}")
     if step_count is not None:
@@ -94,10 +119,12 @@ def run_agent() -> None:
             "recursion_limit": max(100, MAX_STEPS * 8 + 20),
         }
 
-        print("\n⏳ Autonomous ReAct run (agent2)\n")
-        print(f"   plan_mode={PLAN_MODE}")
-        print(f"   max_steps={MAX_STEPS}, max_revisions={MAX_REVISIONS}\n")
-        print("   Flow: plan → reason → act → observe → … → write → end\n")
+        print("\n⏳ Autonomous ReAct run (AI Doer / agent_ai_doer)\n")
+        print(f"   model={MODEL_NAME}, plan_mode={PLAN_MODE}")
+        print(f"   max_steps={MAX_STEPS}, max_revisions={MAX_REVISIONS}")
+        print("   Writes automatically after approval (no human accept).")
+        print("   Output: user-mentioned folder, else sandbox/\n")
+        print("   Flow: set_output_dir → plan → reason → act → observe → write → end\n")
 
         for update in app.stream(
             {
@@ -113,6 +140,7 @@ def run_agent() -> None:
                 "observations": [],
                 "plan": [],
                 "plan_index": 0,
+                "output_dir": "",
             },
             config=config,
             stream_mode="updates",
@@ -125,9 +153,10 @@ def run_agent() -> None:
         status = final_state.get("status", "unknown")
         write_results = final_state.get("write_results") or []
         escalation_reason = final_state.get("escalation_reason")
+        output_dir = final_state.get("output_dir") or "sandbox"
 
         if status == "done":
-            print("✅ Project finished. Files written:")
+            print(f"✅ Project finished. Files written under {output_dir}/:")
             for line in write_results:
                 print(f"   • {line}")
             print()

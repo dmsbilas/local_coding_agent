@@ -14,7 +14,7 @@ The active agent implementation is **`agent2.py`** (ReAct + planning + tool fram
 
 ```
 local_coding_agent/
-├── .env/                 # Python virtual environment (venv)
+├── .venv/                # Python virtual environment (venv)
 ├── agent.py              # Simple autonomous agent (generate → validate loop)
 ├── agent2.py             # ReAct agent — wired to main.py
 ├── agent.md              # Guide for agent.py
@@ -222,7 +222,7 @@ ollama pull qwen2.5-coder:7b
 ## 9. Execution
 
 ```bash
-.env/bin/python main.py
+.venv/bin/python main.py
 ```
 
 - One task per run; fresh `thread_id` per invocation

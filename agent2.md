@@ -356,4 +356,4 @@ No `accept` prompt. The agent is fully autonomous.
 4. Routers (`after_reason`, `after_act`, `after_observe`)  
 5. Tool execution + retries  
 6. `main.py` streaming loop  
-7. Run: `.env/bin/python main.py`
+7. Run: `.venv/bin/python main.py`
