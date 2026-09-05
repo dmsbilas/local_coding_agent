@@ -3,3 +3,6 @@ langchain-core>=1.6.0
 langchain-openai>=1.6.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+
+# Optional — only needed for AGENT=basic or AGENT=react_ollama
+# langchain-ollama>=0.3.0

@@ -1,35 +1,100 @@
 #!/usr/bin/env python3
 """
-CLI entry point for the autonomous ReAct coding agent (AI Doer / gpt-4o).
+CLI entry point for the autonomous ReAct coding agent.
 
-Usage (use the project venv — NOT plain `python` unless .venv is activated):
+Default agent: agents.react_ai_doer (AI Doer / gpt-4o).
+
+Usage:
     source .venv/bin/activate
     python main.py
 
     # or without activating:
     .venv/bin/python main.py
 
-Requires AI_DOER_API_KEY in your environment or .env file.
+    # optional: choose agent via env
+    AGENT=react_ai_doer python main.py   # default (cloud)
+    AGENT=react_ollama python main.py    # local Ollama ReAct
+    AGENT=basic python main.py           # minimal Ollama loop
+
+Requires AI_DOER_API_KEY in .env when using react_ai_doer.
 """
 
+from __future__ import annotations
+
+import os
 import sys
 
-try:
-    from agent_ai_doer import MAX_REVISIONS, MAX_STEPS, MODEL_NAME, PLAN_MODE, app, new_thread_id
-except ModuleNotFoundError as exc:
-    missing = exc.name or "a dependency"
-    print("Missing Python package:", missing, file=sys.stderr)
-    print(file=sys.stderr)
-    print("You are probably not using the project virtualenv (.venv).", file=sys.stderr)
-    print("Fix:", file=sys.stderr)
-    print("  deactivate          # exit any old (.env) venv", file=sys.stderr)
-    print("  source .venv/bin/activate", file=sys.stderr)
-    print("  pip install -r requirements.txt", file=sys.stderr)
-    print("  python main.py", file=sys.stderr)
-    print(file=sys.stderr)
-    print("Or run directly:", file=sys.stderr)
-    print("  .venv/bin/python main.py", file=sys.stderr)
-    sys.exit(1)
+
+def _load_agent():
+    """Import the selected agent module and return its public API."""
+    name = os.getenv("AGENT", "react_ai_doer").strip().lower()
+    try:
+        if name in {"react_ai_doer", "ai_doer", "default"}:
+            from agents.react_ai_doer import (  # noqa: WPS433
+                MAX_REVISIONS,
+                MAX_STEPS,
+                MODEL_NAME,
+                PLAN_MODE,
+                app,
+                new_thread_id,
+            )
+
+            label = "react_ai_doer (AI Doer)"
+        elif name in {"react_ollama", "ollama", "agent2"}:
+            from agents.react_ollama import (  # noqa: WPS433
+                MAX_REVISIONS,
+                MAX_STEPS,
+                MODEL_NAME,
+                PLAN_MODE,
+                app,
+                new_thread_id,
+            )
+
+            label = "react_ollama (Ollama)"
+        elif name in {"basic", "agent"}:
+            from agents.basic import (  # noqa: WPS433
+                MAX_REVISIONS,
+                MODEL_NAME,
+                app,
+                new_thread_id,
+            )
+
+            MAX_STEPS = int(os.getenv("MAX_STEPS", "12"))
+            PLAN_MODE = "n/a"
+            label = "basic (Ollama)"
+        else:
+            print(f"Unknown AGENT={name!r}. Use: react_ai_doer | react_ollama | basic", file=sys.stderr)
+            sys.exit(1)
+    except ModuleNotFoundError as exc:
+        missing = exc.name or "a dependency"
+        print("Missing Python package:", missing, file=sys.stderr)
+        print(file=sys.stderr)
+        print("You are probably not using the project virtualenv (.venv).", file=sys.stderr)
+        print("Fix:", file=sys.stderr)
+        print("  source .venv/bin/activate", file=sys.stderr)
+        print("  pip install -r requirements.txt", file=sys.stderr)
+        print("  python main.py", file=sys.stderr)
+        sys.exit(1)
+
+    return {
+        "app": app,
+        "new_thread_id": new_thread_id,
+        "MAX_REVISIONS": MAX_REVISIONS,
+        "MAX_STEPS": MAX_STEPS,
+        "MODEL_NAME": MODEL_NAME,
+        "PLAN_MODE": PLAN_MODE,
+        "label": label,
+    }
+
+
+AGENT = _load_agent()
+app = AGENT["app"]
+new_thread_id = AGENT["new_thread_id"]
+MAX_REVISIONS = AGENT["MAX_REVISIONS"]
+MAX_STEPS = AGENT["MAX_STEPS"]
+MODEL_NAME = AGENT["MODEL_NAME"]
+PLAN_MODE = AGENT["PLAN_MODE"]
+AGENT_LABEL = AGENT["label"]
 
 
 def read_user_input(prompt: str = "What would you like to build? ") -> str:
@@ -100,7 +165,7 @@ def _print_partial_state(partial: dict | None) -> None:
 
 
 def run_agent() -> None:
-    """Ask for a task, run the ReAct loop until files are written or escalation."""
+    """Ask for a task, run the agent loop until files are written or escalation."""
     while True:
         user_input = read_user_input(
             "Describe the code you want (or type 'quit' to exit): "
@@ -115,16 +180,14 @@ def run_agent() -> None:
 
         config = {
             "configurable": {"thread_id": new_thread_id()},
-            # ReAct runs reason → act → observe per step; allow headroom.
             "recursion_limit": max(100, MAX_STEPS * 8 + 20),
         }
 
-        print("\n⏳ Autonomous ReAct run (AI Doer / agent_ai_doer)\n")
+        print(f"\n⏳ Autonomous run — {AGENT_LABEL}\n")
         print(f"   model={MODEL_NAME}, plan_mode={PLAN_MODE}")
         print(f"   max_steps={MAX_STEPS}, max_revisions={MAX_REVISIONS}")
         print("   Writes automatically after approval (no human accept).")
         print("   Output: user-mentioned folder, else sandbox/\n")
-        print("   Flow: set_output_dir → plan → reason → act → observe → write → end\n")
 
         for update in app.stream(
             {
